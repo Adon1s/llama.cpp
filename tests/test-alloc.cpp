@@ -782,6 +782,53 @@ static void test_sched_ctx_bound() {
     }
 }
 
+static void test_custom_op_noop(ggml_tensor * /*dst*/, int /*ith*/, int /*nth*/, void * /*userdata*/) {}
+
+// 40 nodes on 10 backends, 4 copies. Each node reads the 9 tensors before it and each one needs a copy.
+// The graph copy has 760 nodes and 1485 leafs, the scheduler has 61*49 = 2989 backend id entries for each.
+static void test_sched_parallel_many_inputs() {
+    constexpr int n_backends = 10;
+    constexpr int n_nodes    = 40;
+    constexpr int n_inputs   = 9; // ggml_custom_4d takes at most GGML_MAX_SRC - 1 args
+
+    dummy_backend              dummies[n_backends];
+    ggml_backend_t             backends[n_backends];
+    ggml_backend_buffer_type_t bufts[n_backends];
+    for (int b = 0; b < n_backends; b++) {
+        dummies[b]  = dummy_backend_init(SIZE_MAX);
+        backends[b] = &dummies[b].context->backend;
+        bufts[b]    = &dummies[b].buffer_type;
+    }
+
+    ggml_init_params params{};
+    params.mem_size = (n_inputs + n_nodes)*ggml_tensor_overhead() + ggml_graph_overhead_custom(n_inputs + n_nodes, false);
+    params.no_alloc = true;
+    ggml_context_ptr ctx(ggml_init(params));
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), n_inputs + n_nodes, false);
+
+    // 9 graph inputs, then the nodes. The inputs are on the last backend
+    ggml_tensor * tensors[n_inputs + n_nodes];
+    for (int i = 0; i < n_inputs; i++) {
+        tensors[i] = make_input_1d(ctx.get(), 1);
+    }
+    for (int i = 0; i < n_nodes; i++) {
+        tensors[n_inputs + i] = ggml_custom_4d(ctx.get(), GGML_TYPE_F32, 1, 1, 1, 1, &tensors[i], n_inputs, test_custom_op_noop, 1, nullptr);
+    }
+    ggml_tensor * out = tensors[n_inputs + n_nodes - 1];
+    ggml_set_output(out);
+    ggml_build_forward_expand(graph, out);
+    GGML_ASSERT(graph->n_nodes == n_nodes);
+    GGML_ASSERT(graph->n_leafs == n_inputs);
+
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, bufts, n_backends, n_inputs + n_nodes, true, true));
+    for (int i = 0; i < n_nodes; i++) {
+        // a node is never on the backend of the 9 nodes before it
+        ggml_backend_sched_set_tensor_backend(sched.get(), tensors[n_inputs + i], backends[i % n_backends]);
+    }
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph));
+    GGML_ASSERT(ggml_backend_sched_get_n_splits(sched.get()) == n_nodes);
+}
+
 // Check that the size reported by ggml_backend_alloc_ctx_tensors_from_buft_size
 // matches the actual size of the buffer allocated for the ctx tensors
 static ggml_backend_buffer_ptr check_size_matches(ggml_backend_buffer_type_t buft, ggml_context * ctx) {
@@ -1242,6 +1289,7 @@ int main(int argc, char ** argv) {
     run("test_graph_optimize_many_deps", test_graph_optimize_many_deps);
     run("test_graph_optimize_deps_exceed_creation_size", test_graph_optimize_deps_exceed_creation_size);
     run("test_sched_ctx_bound", test_sched_ctx_bound);
+    run("test_sched_parallel_many_inputs", test_sched_parallel_many_inputs);
     run("test_buft_alloc_buffer_n_single_buffer", test_buft_alloc_buffer_n_single_buffer);
     run("test_buft_alloc_buffer_n_multi_buffer", test_buft_alloc_buffer_n_multi_buffer);
     run("test_buft_alloc_buffer_n_zero_size", test_buft_alloc_buffer_n_zero_size);
